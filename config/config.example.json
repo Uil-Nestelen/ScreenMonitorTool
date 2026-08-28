@@ -1,0 +1,32 @@
+{
+  "camera": {
+    "type": "usb_camera",
+    "device_index": 0,
+    "connection_timeout_seconds": 5,
+    "frame_timeout_seconds": 3,
+    "frozen_frame_timeout_seconds": 5,
+    "expected_width": 1280,
+    "expected_height": 720
+  },
+  "regions": [
+    {
+      "id": "screen_1",
+      "name": "Server Monitor",
+      "x": 100,
+      "y": 200,
+      "width": 300,
+      "height": 150,
+      "red_percentage_threshold": 0.30,
+      "confidence_threshold": 0.80,
+      "confirmation_seconds": 2,
+      "alarm_seconds": 300
+    }
+  ],
+  "watchdog": {
+    "heartbeat_timeout_seconds": 10,
+    "poll_interval_seconds": 2
+  },
+  "data": {
+    "status_directory": "data/status"
+  }
+}

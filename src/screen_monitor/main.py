@@ -1,0 +1,238 @@
+"""Main application entry point.
+
+Proves the pipeline described in section 9 of the plan, now extended
+with region configuration + red detection (section 10, steps 8-9):
+
+    USB camera -> frame reception -> frame health validation ->
+    region detection (if --config given) -> heartbeat ->
+    independent watchdog
+
+Run with:
+
+    python -m screen_monitor [--device-index N] [--status-path PATH] [--config PATH]
+
+The monitoring state machine, alarms, notifications, and the GUI are not
+part of this milestone - see the project plan's growth order (section 10)
+for what comes next. Detection results are logged only; nothing acts on
+them yet.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import signal
+import time
+from pathlib import Path
+from typing import List, Optional
+
+from screen_monitor.camera.frame_health import FrameHealthValidator
+from screen_monitor.camera.usb_camera import UsbCamera, UsbCameraError
+from screen_monitor.common.clock import RealClock
+from screen_monitor.common.enums import FrameHealthReason, SystemState
+from screen_monitor.configuration.loader import (
+    ConfigError,
+    load_config,
+    load_detection_settings,
+    load_regions,
+)
+from screen_monitor.detection.red_detector import DEFAULT_SATURATION_MIN, DEFAULT_VALUE_MIN, RedDetector
+from screen_monitor.detection.region import Region
+from screen_monitor.detection.region_detector import RegionDetector
+from screen_monitor.diagnostics.system_status import build_status
+from screen_monitor.watchdog.heartbeat import HeartbeatWriter
+
+logger = logging.getLogger("screen_monitor.main")
+
+
+class Application:
+    def __init__(
+        self,
+        device_index: int,
+        status_path: Path,
+        frame_timeout_seconds: float,
+        regions: Optional[List[Region]] = None,
+        saturation_min: int = DEFAULT_SATURATION_MIN,
+        value_min: int = DEFAULT_VALUE_MIN,
+        loop_interval_seconds: float = 0.2,
+    ) -> None:
+        self._clock = RealClock()
+        self._camera = UsbCamera(device_index=device_index, clock=self._clock)
+        self._validator = FrameHealthValidator(
+            max_age_seconds=frame_timeout_seconds, clock=self._clock
+        )
+        self._heartbeat = HeartbeatWriter(status_path)
+        self._regions = regions or []
+        self._region_detector = (
+            RegionDetector(RedDetector(saturation_min=saturation_min, value_min=value_min))
+            if self._regions
+            else None
+        )
+        self._loop_interval = loop_interval_seconds
+        self._shutdown_requested = False
+        self._state = SystemState.STARTING
+        self._last_frame_time = None
+        self._last_status_change = self._clock.now()
+
+    def _set_state(self, state: SystemState) -> None:
+        if state != self._state:
+            logger.info("State transition: %s -> %s", self._state.value, state.value)
+            self._state = state
+            self._last_status_change = self._clock.now()
+
+    def request_shutdown(self, *_args) -> None:
+        logger.info("Shutdown requested")
+        self._shutdown_requested = True
+
+    def run(self) -> None:
+        signal.signal(signal.SIGINT, self.request_shutdown)
+        signal.signal(signal.SIGTERM, self.request_shutdown)
+
+        self._set_state(SystemState.SELF_TESTING)
+        try:
+            self._camera.connect()
+        except UsbCameraError as exc:
+            logger.error("Camera self-test failed: %s", exc)
+            self._set_state(SystemState.SYSTEM_FAULT)
+            self._publish_heartbeat()
+            return
+
+        self._set_state(SystemState.MONITORING)
+
+        try:
+            while not self._shutdown_requested:
+                self._loop_once()
+                time.sleep(self._loop_interval)
+        except Exception:
+            logger.exception("Unhandled exception in main loop")
+            self._set_state(SystemState.SYSTEM_FAULT)
+            self._publish_heartbeat()
+            raise
+        finally:
+            self._set_state(SystemState.SHUTTING_DOWN)
+            self._camera.disconnect()
+            self._set_state(SystemState.STOPPED)
+            self._publish_heartbeat()
+
+    def _loop_once(self) -> None:
+        frame = self._camera.read_frame()
+        result = self._validator.validate(frame)
+
+        if result.is_valid:
+            self._last_frame_time = self._clock.now()
+            if self._state != SystemState.MONITORING:
+                self._set_state(SystemState.MONITORING)
+
+            if self._region_detector is not None:
+                for detection in self._region_detector.analyze(frame, self._regions):
+                    logger.info(
+                        "Region '%s': %s (red=%.1f%%, confidence=%.2f) - %s",
+                        detection.region_id,
+                        detection.status.value,
+                        detection.red_percentage * 100,
+                        detection.confidence,
+                        detection.reason,
+                    )
+        else:
+            logger.warning("Frame invalid: %s (%s)", result.reason.value, result.detail)
+            if not self._camera.is_connected():
+                self._set_state(SystemState.SYSTEM_FAULT)
+
+        status = build_status(
+            overall_state=self._state,
+            camera_connected=self._camera.is_connected(),
+            last_frame_reason=result.reason,
+            last_frame_age_seconds=(
+                None
+                if self._last_frame_time is None
+                else self._clock.now() - self._last_frame_time
+            ),
+            watchdog_visible=True,
+        )
+        logger.debug("Status: %s", status)
+
+        self._publish_heartbeat()
+
+    def _publish_heartbeat(self) -> None:
+        # A heartbeat write failure (e.g. a transient file lock on Windows)
+        # should never take down the camera/monitoring loop - it just means
+        # the watchdog sees a slightly stale file for one cycle.
+        try:
+            self._heartbeat.write(
+                current_state=self._state.value,
+                last_loop_time=self._clock.now(),
+                last_frame_time=self._last_frame_time,
+                last_status_change=self._last_status_change,
+            )
+        except OSError:
+            logger.exception("Failed to publish heartbeat this cycle")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Screen monitor")
+    parser.add_argument("--device-index", type=int, default=0, help="USB camera device index")
+    parser.add_argument(
+        "--status-path",
+        default="data/status/heartbeat.json",
+        help="Path to write the heartbeat status file (read by the watchdog)",
+    )
+    parser.add_argument(
+        "--frame-timeout",
+        type=float,
+        default=3.0,
+        help="Seconds after which a received frame is considered stale",
+    )
+    parser.add_argument(
+        "--config",
+        default=None,
+        help=(
+            "Path to a config JSON file with a 'regions' list. If omitted, "
+            "the app runs camera+watchdog only, with no region detection "
+            "(same behavior as before this milestone)."
+        ),
+    )
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+
+    regions: List[Region] = []
+    saturation_min = DEFAULT_SATURATION_MIN
+    value_min = DEFAULT_VALUE_MIN
+    if args.config:
+        try:
+            config = load_config(Path(args.config))
+            regions = load_regions(config)
+            detection_settings = load_detection_settings(config)
+            saturation_min = detection_settings["saturation_min"]
+            value_min = detection_settings["value_min"]
+        except ConfigError as exc:
+            logger.error("Failed to load config: %s", exc)
+            return
+
+        if regions:
+            logger.info(
+                "Loaded %d region(s): %s (saturation_min=%d, value_min=%d)",
+                len(regions),
+                [r.id for r in regions],
+                saturation_min,
+                value_min,
+            )
+        else:
+            logger.warning("Config file has no regions defined - detection will be skipped")
+
+    app = Application(
+        device_index=args.device_index,
+        status_path=Path(args.status_path),
+        frame_timeout_seconds=args.frame_timeout,
+        regions=regions,
+        saturation_min=saturation_min,
+        value_min=value_min,
+    )
+    app.run()
+
+
+if __name__ == "__main__":
+    main()
