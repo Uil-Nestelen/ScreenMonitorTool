@@ -40,6 +40,7 @@ from screen_monitor.detection.red_detector import DEFAULT_SATURATION_MIN, DEFAUL
 from screen_monitor.detection.region import Region
 from screen_monitor.detection.region_detector import RegionDetector
 from screen_monitor.diagnostics.system_status import build_status
+from screen_monitor.monitoring.monitor import RegionMonitor
 from screen_monitor.watchdog.heartbeat import HeartbeatWriter
 
 logger = logging.getLogger("screen_monitor.main")
@@ -68,6 +69,11 @@ class Application:
             if self._regions
             else None
         )
+        # The state machine + timers (confirmation/alarm) that turn raw
+        # per-cycle detection results into region state over time. Alarm
+        # output is a stub for now (default_alarm_hook just logs) - real
+        # local audio / escalation is a later milestone.
+        self._region_monitor = RegionMonitor(self._regions, self._clock) if self._regions else None
         self._loop_interval = loop_interval_seconds
         self._shutdown_requested = False
         self._state = SystemState.STARTING
@@ -124,8 +130,9 @@ class Application:
                 self._set_state(SystemState.MONITORING)
 
             if self._region_detector is not None:
-                for detection in self._region_detector.analyze(frame, self._regions):
-                    logger.info(
+                detections = self._region_detector.analyze(frame, self._regions)
+                for detection in detections:
+                    logger.debug(
                         "Region '%s': %s (red=%.1f%%, confidence=%.2f) - %s",
                         detection.region_id,
                         detection.status.value,
@@ -133,6 +140,14 @@ class Application:
                         detection.confidence,
                         detection.reason,
                     )
+                if self._region_monitor is not None:
+                    # Events (confirmed red, alarm triggered, returned to
+                    # normal, ...) are logged at INFO by RegionMonitor
+                    # itself, so per-cycle raw detections above are
+                    # deliberately dropped to DEBUG - this is what keeps
+                    # the log readable once regions are actually being
+                    # tracked over time instead of just printed each cycle.
+                    self._region_monitor.process(detections)
         else:
             logger.warning("Frame invalid: %s (%s)", result.reason.value, result.detail)
             if not self._camera.is_connected():
