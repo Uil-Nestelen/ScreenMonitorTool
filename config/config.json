@@ -1,0 +1,32 @@
+{
+  "regions": [
+    {
+      "id": "test-zone1",
+      "name": "bigzone",
+      "x": 400,
+      "y": 142,
+      "width": 135,
+      "height": 168,
+      "red_percentage_threshold": 0.3,
+      "confidence_threshold": 0.8,
+      "confirmation_seconds": 2.0,
+      "alarm_seconds": 300.0
+    },
+    {
+      "id": "test-zone2",
+      "name": "smallzone",
+      "x": 182,
+      "y": 200,
+      "width": 75,
+      "height": 108,
+      "red_percentage_threshold": 0.3,
+      "confidence_threshold": 0.8,
+      "confirmation_seconds": 2.0,
+      "alarm_seconds": 300.0
+    }
+  ],
+  "detection": {
+    "saturation_min": 70,
+    "value_min": 50
+  }
+}
