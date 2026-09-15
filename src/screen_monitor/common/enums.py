@@ -47,3 +47,21 @@ class ImageQuality(Enum):
     OVEREXPOSED = "OVEREXPOSED"
     LOW_CONTRAST = "LOW_CONTRAST"
     UNKNOWN = "UNKNOWN"
+
+
+class RegionStatus(Enum):
+    """Per-region monitoring state (plan section 4.4 / 12, Rule 4).
+
+    NORMAL -> RED_PENDING -> RED_ACTIVE -> ALARM_ACTIVE ->
+    ALARM_ACKNOWLEDGED -> NORMAL
+
+    ALARM_ACTIVE only ever leaves via an explicit acknowledgment, never
+    because a detection reading happens to read NORMAL again - an
+    unacknowledged alarm must not be able to clear itself.
+    """
+
+    NORMAL = "NORMAL"
+    RED_PENDING = "RED_PENDING"
+    RED_ACTIVE = "RED_ACTIVE"
+    ALARM_ACTIVE = "ALARM_ACTIVE"
+    ALARM_ACKNOWLEDGED = "ALARM_ACKNOWLEDGED"
