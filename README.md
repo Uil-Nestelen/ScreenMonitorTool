@@ -1,6 +1,8 @@
 # Screen Red-Alert Monitoring System
 
-Milestones so far, per the project's development plan: camera capture → frame-health → heartbeat → independent watchdog (section 9); region configuration and HSV-based red detection (section 10, steps 8-9); and now the region state machine + confirmation/alarm timers (section 10, steps 10-11).
+Milestones so far, per the project's development plan: camera capture → frame-health → heartbeat → independent watchdog (section 9); region configuration and HSV-based red detection (section 10, steps 8-9); the region state machine + confirmation/alarm timers (section 10, steps 10-11); local alarm output (section 10, step 12); and now stream-level health monitoring (section 10, step 4 — built out of order, after local alarm, by choice).
+
+**Deliberately skipped for now:** remote notifications (step 13) and watchdog failure notifications (step 7). Both exist in the plan for someone who isn't in the room with the machine — since the local alarm is always audible in person, these were dropped as unnecessary complexity rather than deferred by oversight. Revisit if this ever needs to run unattended.
 
 ```
 USB webcam
@@ -9,7 +11,9 @@ Python (OpenCV VideoCapture)
      ↓
 Frame reception
      ↓
-Frame health validation (missing / undersized / empty / stale)
+Frame health validation (missing / undersized / empty / stale) - one frame at a time
+     ↓
+Stream health monitoring (frame rate, frozen-stream detection, timeout) - across frames, over time
      ↓
 Region detection (if --config given): crop each region, check image
 quality, run HSV red-percentage detection → RED / NORMAL / UNKNOWN
@@ -18,18 +22,35 @@ Region monitoring: state machine turns per-cycle detections into
 NORMAL → RED_PENDING → RED_ACTIVE → ALARM_ACTIVE → ALARM_ACKNOWLEDGED,
 using each region's confirmation_seconds / alarm_seconds
      ↓
+Local alarm: AlarmManager plays a repeating beep for every ALARM_ACTIVE
+region until it's acknowledged (--alarm-repeat-seconds, default 5s)
+     ↓
 Heartbeat file (atomic write)
      ↓
 Independent watchdog process (separate from the main process)
 ```
 
-Region state transitions are logged at INFO (raw per-cycle detections are now DEBUG, to keep the log readable). Real alarm output (local sound, escalation) and notifications are still the next milestones — an alarm-triggered event currently just logs a loud warning via a placeholder hook (`monitoring/monitor.py`'s `default_alarm_hook`).
+Region state transitions are logged at INFO (raw per-cycle detections are DEBUG). Stream health transitions (frozen/timeout starting or clearing) log at WARNING/INFO too, but only on the transition itself, not every cycle.
 
 ## How region monitoring behaves
 
 - `RED_PENDING` only becomes `RED_ACTIVE` once red has been continuously read for a region's `confirmation_seconds`; `RED_ACTIVE` only becomes `ALARM_ACTIVE` after `alarm_seconds`.
 - **UNKNOWN readings (camera glitch, bad image quality) never reset or pause a running timer once a red condition is already in progress** — they're treated the same as RED. This is a deliberate fail-safe extension of Rule 4 ("UNKNOWN must never silently become NORMAL"): a flaky camera must not be able to delay or hide a real alarm. An UNKNOWN reading from `NORMAL`, though, does *not* start a new timer — only an actual RED reading can originate one.
-- **`ALARM_ACTIVE` only ever clears via explicit acknowledgment** (`RegionMonitor.acknowledge(region_id)`), never just because a later reading happens to come back NORMAL or UNKNOWN. This prevents a brief flicker (or a person briefly blocking the camera) from silently cancelling a real alarm. There's no CLI/GUI hookup for acknowledgment yet — that arrives with the GUI milestone.
+- **`ALARM_ACTIVE` only ever clears via explicit acknowledgment** (`RegionMonitor.acknowledge(region_id)`), never just because a later reading happens to come back NORMAL or UNKNOWN. This prevents a brief flicker (or a person briefly blocking the camera) from silently cancelling a real alarm. There's no GUI hookup for acknowledgment yet — see `--interactive-ack` below for testing in the meantime.
+
+## How local alarm output behaves
+
+- `AlarmManager` plays a beep the moment a region hits `ALARM_ACTIVE`, then repeats it every `--alarm-repeat-seconds` (default 5s) for as long as that region stays `ALARM_ACTIVE` and unacknowledged.
+- Acknowledging a region (or it returning to `NORMAL`, which per the state machine can only happen after acknowledgment anyway) stops the repeats immediately.
+- The actual "make noise" step is `alarms/local_audio.py`'s `SystemBeepBackend` - `winsound.Beep` on Windows, an ASCII bell character elsewhere. It's a placeholder for a real alert sound (`SoundFileBackend` is stubbed in the same file, not yet wired up to a playback library) - swap it in via `AlarmManager(audio_backend=...)` once a real sound and library are picked.
+- Per Rule 1, `AlarmManager` only decides *when* to make noise; it doesn't know why a region is alarming, and `RegionStateMachine`/`RegionMonitor` don't know alarms make sound at all.
+
+## How stream health monitoring behaves
+
+- `StreamMonitor` (`camera/stream_monitor.py`) tracks the camera stream *over time*, separately from `frame_health.py`'s per-frame checks: frame rate, whether the picture is actually changing (a stuck camera driver can keep returning a perfectly valid, non-stale frame that just never updates), and whether valid frames have stopped arriving at all.
+- **Frozen-stream detection** compares a small downsized thumbnail of each frame; if it's pixel-identical to the last one for longer than `--stream-frozen-threshold` (default 5s), the stream is flagged `frozen`. A genuinely live feed has enough sensor noise that this essentially never false-positives.
+- **Timeout detection** flags `timed_out` once no valid frame has arrived for `--stream-timeout` (defaults to `--frame-timeout` if not set separately).
+- Neither `frozen` nor `timed_out` currently forces a `SystemState` transition on their own — `StreamMonitor` only reports; `main.py` logs transitions and folds the status into `SystemStatus.camera_status` (which becomes `FAULT` when either is true), visible via the heartbeat file. Whether frozen/timeout should also force `SYSTEM_FAULT` the way a hard camera disconnect does is an open decision — ask if you want that wired in too.
 
 ## Install
 
@@ -53,11 +74,23 @@ To also run region detection, pass a config file with a `regions` list:
 python -m screen_monitor --device-index 0 --config config/config.json
 ```
 
-Each cycle logs one line per region, e.g.:
+Region state transitions log at INFO, e.g.:
 
 ```
-Region 'screen_1': RED (red=42.3%, confidence=0.71) - Red pixel percentage 42.3% meets or exceeds threshold 30.0%
+Event: REGION_RED_CONFIRMED (region='test-zone1') - Red pixel percentage 42.3% meets or exceeds threshold 30.0%
+Event: REGION_ALARM_TRIGGERED (region='test-zone1') - Region 'test-zone1' has been continuously red for at least 300s
 ```
+
+(Raw per-cycle detections still happen every loop, but log at DEBUG, to keep this readable.)
+
+Two extra flags round out testing before the GUI exists:
+
+```bash
+python -m screen_monitor --config config/config.json --interactive-ack --alarm-repeat-seconds 5
+```
+
+- `--interactive-ack` — type `ack` (or `ack <region_id>` with multiple regions) at the terminal to acknowledge an active alarm. Temporary; removed once the GUI adds a real acknowledge button.
+- `--alarm-repeat-seconds` — how often the alarm beep repeats while a region is `ALARM_ACTIVE` and unacknowledged (default 5s).
 
 ## Find your region's pixel coordinates and calibrate detection
 
@@ -108,7 +141,7 @@ Tests use a `FakeClock`, synthetic images, and temp directories, so no real came
 
 ## What's intentionally NOT here yet
 
-Per the plan's recommended growth order (section 10), next up: real local alarm output (`alarms/local_audio.py`, escalation timing) and remote notifications. `RegionMonitor`'s `alarm_hook` seam is already in place for `alarm_manager.py` to plug into. The GUI comes later still, and should stay a pure presentation layer — it must never own state or read the camera directly, and will be where `acknowledge()` finally gets a real caller.
+Per the plan's recommended growth order (section 10): remote notifications (step 13) and watchdog failure notifications (step 7) are deliberately skipped, not forgotten — see the note at the top. What's left of the growth order: a dedicated startup self-test module (step 14 — `main.py` does a minimal inline version today), the GUI (step 15), logging/audit trail (step 16), automatic recovery (step 17), failure-injection testing (step 18), and packaging/deployment (step 19). The GUI should stay a pure presentation layer — it must never own state or read the camera directly, and will be where `acknowledge()` finally gets a real caller (`--interactive-ack` is temporary test scaffolding for that in the meantime — see `main.py`).
 
 ## Project layout
 
@@ -118,14 +151,16 @@ screen-monitor/
 ├── config/config.example.json
 ├── src/screen_monitor/
 │   ├── __main__.py, main.py        # main monitoring loop
-│   ├── camera/                     # source.py interface, usb_camera.py, frame.py, frame_health.py
+│   ├── camera/                     # source.py interface, usb_camera.py, frame.py, frame_health.py, stream_monitor.py
 │   ├── detection/                  # region.py, detector.py, red_detector.py, region_detector.py, confidence.py, image_quality.py
 │   ├── monitoring/                 # region_state.py, timer.py, state_machine.py, events.py, monitor.py
+│   ├── alarms/                     # alarm_manager.py, local_audio.py
 │   ├── configuration/loader.py     # minimal JSON config + region loading
 │   ├── watchdog/                   # heartbeat.py (shared contract), watchdog.py (independent process)
 │   ├── diagnostics/system_status.py
 │   └── common/                     # enums.py, clock.py (testable time abstraction)
-├── tools/                          # camera_viewer.py, region_selector.py
+├── tools/                          # camera_viewer.py, region_selector.py, simulate_monitor.py
 └── tests/                          # test_camera.py, test_watchdog.py, test_region.py, test_red_detector.py,
-                                     # test_timer.py, test_state_machine.py, test_monitor.py
+                                     # test_timer.py, test_state_machine.py, test_monitor.py, test_alarm_manager.py,
+                                     # test_stream_monitor.py
 ```

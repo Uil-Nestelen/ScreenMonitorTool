@@ -21,13 +21,15 @@ from __future__ import annotations
 
 import argparse
 import logging
-import threading
 import signal
+import threading
 import time
 from pathlib import Path
 from typing import List, Optional
 
+from screen_monitor.alarms.alarm_manager import DEFAULT_REPEAT_INTERVAL_SECONDS, AlarmManager
 from screen_monitor.camera.frame_health import FrameHealthValidator
+from screen_monitor.camera.stream_monitor import StreamMonitor
 from screen_monitor.camera.usb_camera import UsbCamera, UsbCameraError
 from screen_monitor.common.clock import RealClock
 from screen_monitor.common.enums import FrameHealthReason, SystemState
@@ -58,6 +60,9 @@ class Application:
         value_min: int = DEFAULT_VALUE_MIN,
         loop_interval_seconds: float = 0.2,
         interactive_ack: bool = False,
+        alarm_repeat_interval_seconds: float = DEFAULT_REPEAT_INTERVAL_SECONDS,
+        stream_frozen_threshold_seconds: float = 5.0,
+        stream_timeout_seconds: Optional[float] = None,
     ) -> None:
         self._clock = RealClock()
         self._camera = UsbCamera(device_index=device_index, clock=self._clock)
@@ -65,6 +70,19 @@ class Application:
             max_age_seconds=frame_timeout_seconds, clock=self._clock
         )
         self._heartbeat = HeartbeatWriter(status_path)
+        # Stream-level health across many frames (growth-order step 4):
+        # frame rate, whether the picture is actually changing (frozen
+        # detection), and connection/timeout state. Reuses frame_timeout
+        # for its own timeout window unless a distinct value is given -
+        # frame_health.py's staleness check and this are related but
+        # separate concerns (one frame vs. the stream over time).
+        self._stream_monitor = StreamMonitor(
+            frozen_threshold_seconds=stream_frozen_threshold_seconds,
+            timeout_seconds=(
+                stream_timeout_seconds if stream_timeout_seconds is not None else frame_timeout_seconds
+            ),
+            clock=self._clock,
+        )
         self._regions = regions or []
         self._region_detector = (
             RegionDetector(RedDetector(saturation_min=saturation_min, value_min=value_min))
@@ -72,16 +90,28 @@ class Application:
             else None
         )
         # The state machine + timers (confirmation/alarm) that turn raw
-        # per-cycle detection results into region state over time. Alarm
-        # output is a stub for now (default_alarm_hook just logs) - real
-        # local audio / escalation is a later milestone.
+        # per-cycle detection results into region state over time.
         self._region_monitor = RegionMonitor(self._regions, self._clock) if self._regions else None
+        # Real local alarm output (milestone 5): repeats a beep for every
+        # ALARM_ACTIVE region until it's acknowledged. RegionMonitor's own
+        # default_alarm_hook still fires once per trigger too (it's just a
+        # log line) - AlarmManager is driven separately below since it also
+        # needs ALARM_ACKNOWLEDGED/REGION_RETURNED_NORMAL events (to stop
+        # repeating) and a per-cycle tick() (to repeat on a schedule), not
+        # just the single REGION_ALARM_TRIGGERED event the hook seam covers.
+        self._alarm_manager = (
+            AlarmManager(self._clock, repeat_interval_seconds=alarm_repeat_interval_seconds)
+            if self._regions
+            else None
+        )
         self._interactive_ack = interactive_ack
         self._loop_interval = loop_interval_seconds
         self._shutdown_requested = False
         self._state = SystemState.STARTING
         self._last_frame_time = None
         self._last_status_change = self._clock.now()
+        self._stream_was_frozen = False
+        self._stream_was_timed_out = False
 
     def _set_state(self, state: SystemState) -> None:
         if state != self._state:
@@ -130,6 +160,11 @@ class Application:
         frame = self._camera.read_frame()
         result = self._validator.validate(frame)
 
+        # Runs regardless of per-frame validity - StreamMonitor needs to
+        # see invalid/stale cycles too, to correctly track timeout state.
+        stream_status = self._stream_monitor.update(frame, result.is_valid)
+        self._log_stream_transitions(stream_status)
+
         if result.is_valid:
             self._last_frame_time = self._clock.now()
             if self._state != SystemState.MONITORING:
@@ -153,11 +188,20 @@ class Application:
                     # deliberately dropped to DEBUG - this is what keeps
                     # the log readable once regions are actually being
                     # tracked over time instead of just printed each cycle.
-                    self._region_monitor.process(detections)
+                    events = self._region_monitor.process(detections)
+                    if self._alarm_manager is not None:
+                        for event in events:
+                            self._alarm_manager.handle_event(event)
         else:
             logger.warning("Frame invalid: %s (%s)", result.reason.value, result.detail)
             if not self._camera.is_connected():
                 self._set_state(SystemState.SYSTEM_FAULT)
+
+        if self._alarm_manager is not None:
+            # Runs every cycle regardless of frame validity or new
+            # events - a repeat beep can be due on a cycle with nothing
+            # new to report.
+            self._alarm_manager.tick()
 
         status = build_status(
             overall_state=self._state,
@@ -169,11 +213,39 @@ class Application:
                 else self._clock.now() - self._last_frame_time
             ),
             watchdog_visible=True,
+            stream_frame_rate=stream_status.frame_rate,
+            stream_frozen=stream_status.frozen,
+            stream_timed_out=stream_status.timed_out,
         )
         logger.debug("Status: %s", status)
 
         self._publish_heartbeat()
-    
+
+    def _log_stream_transitions(self, stream_status) -> None:
+        # Logged on transitions only (not every cycle) to avoid spamming
+        # the log every 0.2s while a fault condition persists - INFO
+        # already covers every region state transition, so this stays
+        # readable alongside that.
+        if stream_status.frozen != self._stream_was_frozen:
+            if stream_status.frozen:
+                logger.warning(
+                    "Stream appears frozen - no pixel change for over %.1fs",
+                    stream_status.last_changed_frame_age_seconds or 0.0,
+                )
+            else:
+                logger.info("Stream is no longer frozen - picture is changing again")
+            self._stream_was_frozen = stream_status.frozen
+
+        if stream_status.timed_out != self._stream_was_timed_out:
+            if stream_status.timed_out:
+                logger.warning(
+                    "Stream timed out - no valid frame for over %.1fs",
+                    stream_status.last_valid_frame_age_seconds or 0.0,
+                )
+            else:
+                logger.info("Stream recovered from timeout - valid frames arriving again")
+            self._stream_was_timed_out = stream_status.timed_out
+
     def _start_interactive_ack_listener(self) -> None:
         """TEMPORARY test scaffolding for milestone 4: lets you type "ack"
         (or "ack <region_id>" with multiple regions) at the terminal to
@@ -186,7 +258,7 @@ class Application:
             f"[interactive-ack] Type 'ack' to acknowledge an alarm "
             f"(regions: {region_ids}). Use 'ack <region_id>' if there's more than one."
         )
- 
+
         def _listen() -> None:
             for line in iter(input, ""):
                 parts = line.strip().split()
@@ -203,8 +275,10 @@ class Application:
                 if event is None:
                     print(f"No-op: region '{region_id}' isn't currently ALARM_ACTIVE (or doesn't exist)")
                 else:
+                    if self._alarm_manager is not None:
+                        self._alarm_manager.handle_event(event)
                     print(f"Acknowledged region '{region_id}'")
- 
+
         thread = threading.Thread(target=_listen, daemon=True)
         thread.start()
 
@@ -255,6 +329,27 @@ def main() -> None:
             "GUI yet. Will be removed once the GUI milestone exists."
         ),
     )
+    parser.add_argument(
+        "--alarm-repeat-seconds",
+        type=float,
+        default=DEFAULT_REPEAT_INTERVAL_SECONDS,
+        help="Seconds between repeated alarm beeps while a region is ALARM_ACTIVE",
+    )
+    parser.add_argument(
+        "--stream-frozen-threshold",
+        type=float,
+        default=5.0,
+        help="Seconds of an unchanging picture before the stream is considered frozen",
+    )
+    parser.add_argument(
+        "--stream-timeout",
+        type=float,
+        default=None,
+        help=(
+            "Seconds with no valid frame before the stream is considered timed "
+            "out. Defaults to --frame-timeout if not given."
+        ),
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -295,6 +390,9 @@ def main() -> None:
         saturation_min=saturation_min,
         value_min=value_min,
         interactive_ack=args.interactive_ack,
+        alarm_repeat_interval_seconds=args.alarm_repeat_seconds,
+        stream_frozen_threshold_seconds=args.stream_frozen_threshold,
+        stream_timeout_seconds=args.stream_timeout,
     )
     app.run()
 
