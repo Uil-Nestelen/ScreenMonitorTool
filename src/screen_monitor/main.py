@@ -29,6 +29,7 @@ from typing import List, Optional
 
 from screen_monitor.alarms.alarm_manager import DEFAULT_REPEAT_INTERVAL_SECONDS, AlarmManager
 from screen_monitor.camera.frame_health import FrameHealthValidator
+from screen_monitor.camera.stream_monitor import StreamMonitor
 from screen_monitor.camera.usb_camera import UsbCamera, UsbCameraError
 from screen_monitor.common.clock import RealClock
 from screen_monitor.common.enums import FrameHealthReason, SystemState
@@ -60,6 +61,8 @@ class Application:
         loop_interval_seconds: float = 0.2,
         interactive_ack: bool = False,
         alarm_repeat_interval_seconds: float = DEFAULT_REPEAT_INTERVAL_SECONDS,
+        stream_frozen_threshold_seconds: float = 5.0,
+        stream_timeout_seconds: Optional[float] = None,
     ) -> None:
         self._clock = RealClock()
         self._camera = UsbCamera(device_index=device_index, clock=self._clock)
@@ -67,6 +70,19 @@ class Application:
             max_age_seconds=frame_timeout_seconds, clock=self._clock
         )
         self._heartbeat = HeartbeatWriter(status_path)
+        # Stream-level health across many frames (growth-order step 4):
+        # frame rate, whether the picture is actually changing (frozen
+        # detection), and connection/timeout state. Reuses frame_timeout
+        # for its own timeout window unless a distinct value is given -
+        # frame_health.py's staleness check and this are related but
+        # separate concerns (one frame vs. the stream over time).
+        self._stream_monitor = StreamMonitor(
+            frozen_threshold_seconds=stream_frozen_threshold_seconds,
+            timeout_seconds=(
+                stream_timeout_seconds if stream_timeout_seconds is not None else frame_timeout_seconds
+            ),
+            clock=self._clock,
+        )
         self._regions = regions or []
         self._region_detector = (
             RegionDetector(RedDetector(saturation_min=saturation_min, value_min=value_min))
@@ -94,6 +110,8 @@ class Application:
         self._state = SystemState.STARTING
         self._last_frame_time = None
         self._last_status_change = self._clock.now()
+        self._stream_was_frozen = False
+        self._stream_was_timed_out = False
 
     def _set_state(self, state: SystemState) -> None:
         if state != self._state:
@@ -141,6 +159,11 @@ class Application:
     def _loop_once(self) -> None:
         frame = self._camera.read_frame()
         result = self._validator.validate(frame)
+
+        # Runs regardless of per-frame validity - StreamMonitor needs to
+        # see invalid/stale cycles too, to correctly track timeout state.
+        stream_status = self._stream_monitor.update(frame, result.is_valid)
+        self._log_stream_transitions(stream_status)
 
         if result.is_valid:
             self._last_frame_time = self._clock.now()
@@ -190,10 +213,38 @@ class Application:
                 else self._clock.now() - self._last_frame_time
             ),
             watchdog_visible=True,
+            stream_frame_rate=stream_status.frame_rate,
+            stream_frozen=stream_status.frozen,
+            stream_timed_out=stream_status.timed_out,
         )
         logger.debug("Status: %s", status)
 
         self._publish_heartbeat()
+
+    def _log_stream_transitions(self, stream_status) -> None:
+        # Logged on transitions only (not every cycle) to avoid spamming
+        # the log every 0.2s while a fault condition persists - INFO
+        # already covers every region state transition, so this stays
+        # readable alongside that.
+        if stream_status.frozen != self._stream_was_frozen:
+            if stream_status.frozen:
+                logger.warning(
+                    "Stream appears frozen - no pixel change for over %.1fs",
+                    stream_status.last_changed_frame_age_seconds or 0.0,
+                )
+            else:
+                logger.info("Stream is no longer frozen - picture is changing again")
+            self._stream_was_frozen = stream_status.frozen
+
+        if stream_status.timed_out != self._stream_was_timed_out:
+            if stream_status.timed_out:
+                logger.warning(
+                    "Stream timed out - no valid frame for over %.1fs",
+                    stream_status.last_valid_frame_age_seconds or 0.0,
+                )
+            else:
+                logger.info("Stream recovered from timeout - valid frames arriving again")
+            self._stream_was_timed_out = stream_status.timed_out
 
     def _start_interactive_ack_listener(self) -> None:
         """TEMPORARY test scaffolding for milestone 4: lets you type "ack"
@@ -284,6 +335,21 @@ def main() -> None:
         default=DEFAULT_REPEAT_INTERVAL_SECONDS,
         help="Seconds between repeated alarm beeps while a region is ALARM_ACTIVE",
     )
+    parser.add_argument(
+        "--stream-frozen-threshold",
+        type=float,
+        default=5.0,
+        help="Seconds of an unchanging picture before the stream is considered frozen",
+    )
+    parser.add_argument(
+        "--stream-timeout",
+        type=float,
+        default=None,
+        help=(
+            "Seconds with no valid frame before the stream is considered timed "
+            "out. Defaults to --frame-timeout if not given."
+        ),
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -325,6 +391,8 @@ def main() -> None:
         value_min=value_min,
         interactive_ack=args.interactive_ack,
         alarm_repeat_interval_seconds=args.alarm_repeat_seconds,
+        stream_frozen_threshold_seconds=args.stream_frozen_threshold,
+        stream_timeout_seconds=args.stream_timeout,
     )
     app.run()
 
