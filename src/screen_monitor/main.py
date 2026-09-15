@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import threading
 import signal
 import time
 from pathlib import Path
@@ -56,6 +57,7 @@ class Application:
         saturation_min: int = DEFAULT_SATURATION_MIN,
         value_min: int = DEFAULT_VALUE_MIN,
         loop_interval_seconds: float = 0.2,
+        interactive_ack: bool = False,
     ) -> None:
         self._clock = RealClock()
         self._camera = UsbCamera(device_index=device_index, clock=self._clock)
@@ -74,6 +76,7 @@ class Application:
         # output is a stub for now (default_alarm_hook just logs) - real
         # local audio / escalation is a later milestone.
         self._region_monitor = RegionMonitor(self._regions, self._clock) if self._regions else None
+        self._interactive_ack = interactive_ack
         self._loop_interval = loop_interval_seconds
         self._shutdown_requested = False
         self._state = SystemState.STARTING
@@ -104,6 +107,9 @@ class Application:
             return
 
         self._set_state(SystemState.MONITORING)
+
+        if self._interactive_ack and self._region_monitor is not None:
+            self._start_interactive_ack_listener()
 
         try:
             while not self._shutdown_requested:
@@ -167,6 +173,40 @@ class Application:
         logger.debug("Status: %s", status)
 
         self._publish_heartbeat()
+    
+    def _start_interactive_ack_listener(self) -> None:
+        """TEMPORARY test scaffolding for milestone 4: lets you type "ack"
+        (or "ack <region_id>" with multiple regions) at the terminal to
+        acknowledge an active alarm, since there's no GUI yet to do it for
+        real. Remove this once the GUI milestone adds a real caller for
+        RegionMonitor.acknowledge().
+        """
+        region_ids = [r.id for r in self._regions]
+        print(
+            f"[interactive-ack] Type 'ack' to acknowledge an alarm "
+            f"(regions: {region_ids}). Use 'ack <region_id>' if there's more than one."
+        )
+ 
+        def _listen() -> None:
+            for line in iter(input, ""):
+                parts = line.strip().split()
+                if not parts or parts[0] != "ack":
+                    continue
+                if len(parts) >= 2:
+                    region_id = parts[1]
+                elif len(region_ids) == 1:
+                    region_id = region_ids[0]
+                else:
+                    print(f"Multiple regions configured - use: ack <region_id> ({region_ids})")
+                    continue
+                event = self._region_monitor.acknowledge(region_id)
+                if event is None:
+                    print(f"No-op: region '{region_id}' isn't currently ALARM_ACTIVE (or doesn't exist)")
+                else:
+                    print(f"Acknowledged region '{region_id}'")
+ 
+        thread = threading.Thread(target=_listen, daemon=True)
+        thread.start()
 
     def _publish_heartbeat(self) -> None:
         # A heartbeat write failure (e.g. a transient file lock on Windows)
@@ -204,6 +244,15 @@ def main() -> None:
             "Path to a config JSON file with a 'regions' list. If omitted, "
             "the app runs camera+watchdog only, with no region detection "
             "(same behavior as before this milestone)."
+        ),
+    )
+    parser.add_argument(
+        "--interactive-ack",
+        action="store_true",
+        help=(
+            "TEMPORARY test flag for milestone 4: lets you type 'ack' in "
+            "the terminal to acknowledge an active alarm, since there's no "
+            "GUI yet. Will be removed once the GUI milestone exists."
         ),
     )
     args = parser.parse_args()
@@ -245,6 +294,7 @@ def main() -> None:
         regions=regions,
         saturation_min=saturation_min,
         value_min=value_min,
+        interactive_ack=args.interactive_ack,
     )
     app.run()
 
