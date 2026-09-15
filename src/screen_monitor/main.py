@@ -21,12 +21,13 @@ from __future__ import annotations
 
 import argparse
 import logging
-import threading
 import signal
+import threading
 import time
 from pathlib import Path
 from typing import List, Optional
 
+from screen_monitor.alarms.alarm_manager import DEFAULT_REPEAT_INTERVAL_SECONDS, AlarmManager
 from screen_monitor.camera.frame_health import FrameHealthValidator
 from screen_monitor.camera.usb_camera import UsbCamera, UsbCameraError
 from screen_monitor.common.clock import RealClock
@@ -58,6 +59,7 @@ class Application:
         value_min: int = DEFAULT_VALUE_MIN,
         loop_interval_seconds: float = 0.2,
         interactive_ack: bool = False,
+        alarm_repeat_interval_seconds: float = DEFAULT_REPEAT_INTERVAL_SECONDS,
     ) -> None:
         self._clock = RealClock()
         self._camera = UsbCamera(device_index=device_index, clock=self._clock)
@@ -72,10 +74,20 @@ class Application:
             else None
         )
         # The state machine + timers (confirmation/alarm) that turn raw
-        # per-cycle detection results into region state over time. Alarm
-        # output is a stub for now (default_alarm_hook just logs) - real
-        # local audio / escalation is a later milestone.
+        # per-cycle detection results into region state over time.
         self._region_monitor = RegionMonitor(self._regions, self._clock) if self._regions else None
+        # Real local alarm output (milestone 5): repeats a beep for every
+        # ALARM_ACTIVE region until it's acknowledged. RegionMonitor's own
+        # default_alarm_hook still fires once per trigger too (it's just a
+        # log line) - AlarmManager is driven separately below since it also
+        # needs ALARM_ACKNOWLEDGED/REGION_RETURNED_NORMAL events (to stop
+        # repeating) and a per-cycle tick() (to repeat on a schedule), not
+        # just the single REGION_ALARM_TRIGGERED event the hook seam covers.
+        self._alarm_manager = (
+            AlarmManager(self._clock, repeat_interval_seconds=alarm_repeat_interval_seconds)
+            if self._regions
+            else None
+        )
         self._interactive_ack = interactive_ack
         self._loop_interval = loop_interval_seconds
         self._shutdown_requested = False
@@ -153,11 +165,20 @@ class Application:
                     # deliberately dropped to DEBUG - this is what keeps
                     # the log readable once regions are actually being
                     # tracked over time instead of just printed each cycle.
-                    self._region_monitor.process(detections)
+                    events = self._region_monitor.process(detections)
+                    if self._alarm_manager is not None:
+                        for event in events:
+                            self._alarm_manager.handle_event(event)
         else:
             logger.warning("Frame invalid: %s (%s)", result.reason.value, result.detail)
             if not self._camera.is_connected():
                 self._set_state(SystemState.SYSTEM_FAULT)
+
+        if self._alarm_manager is not None:
+            # Runs every cycle regardless of frame validity or new
+            # events - a repeat beep can be due on a cycle with nothing
+            # new to report.
+            self._alarm_manager.tick()
 
         status = build_status(
             overall_state=self._state,
@@ -173,7 +194,7 @@ class Application:
         logger.debug("Status: %s", status)
 
         self._publish_heartbeat()
-    
+
     def _start_interactive_ack_listener(self) -> None:
         """TEMPORARY test scaffolding for milestone 4: lets you type "ack"
         (or "ack <region_id>" with multiple regions) at the terminal to
@@ -186,7 +207,7 @@ class Application:
             f"[interactive-ack] Type 'ack' to acknowledge an alarm "
             f"(regions: {region_ids}). Use 'ack <region_id>' if there's more than one."
         )
- 
+
         def _listen() -> None:
             for line in iter(input, ""):
                 parts = line.strip().split()
@@ -203,8 +224,10 @@ class Application:
                 if event is None:
                     print(f"No-op: region '{region_id}' isn't currently ALARM_ACTIVE (or doesn't exist)")
                 else:
+                    if self._alarm_manager is not None:
+                        self._alarm_manager.handle_event(event)
                     print(f"Acknowledged region '{region_id}'")
- 
+
         thread = threading.Thread(target=_listen, daemon=True)
         thread.start()
 
@@ -255,6 +278,12 @@ def main() -> None:
             "GUI yet. Will be removed once the GUI milestone exists."
         ),
     )
+    parser.add_argument(
+        "--alarm-repeat-seconds",
+        type=float,
+        default=DEFAULT_REPEAT_INTERVAL_SECONDS,
+        help="Seconds between repeated alarm beeps while a region is ALARM_ACTIVE",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -295,6 +324,7 @@ def main() -> None:
         saturation_min=saturation_min,
         value_min=value_min,
         interactive_ack=args.interactive_ack,
+        alarm_repeat_interval_seconds=args.alarm_repeat_seconds,
     )
     app.run()
 
