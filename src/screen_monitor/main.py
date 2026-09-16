@@ -1,20 +1,24 @@
 """Main application entry point.
 
-Proves the pipeline described in section 9 of the plan, now extended
-with region configuration + red detection (section 10, steps 8-9):
+Full pipeline through the GUI milestone (plan section 10, steps 1-12,
+step 4, and 15):
 
     USB camera -> frame reception -> frame health validation ->
-    region detection (if --config given) -> heartbeat ->
+    stream health monitoring -> region detection (if --config given) ->
+    region state machine -> local alarm -> heartbeat ->
     independent watchdog
 
-Run with:
+Run headless:
 
     python -m screen_monitor [--device-index N] [--status-path PATH] [--config PATH]
 
-The monitoring state machine, alarms, notifications, and the GUI are not
-part of this milestone - see the project plan's growth order (section 10)
-for what comes next. Detection results are logged only; nothing acts on
-them yet.
+Or with the live dashboard:
+
+    python -m screen_monitor --config PATH --gui
+
+Remote notifications (step 13) and watchdog failure notifications
+(step 7) are deliberately skipped - see README. Step 14 (a dedicated
+startup self-test module) is deferred until after step 17.
 """
 
 from __future__ import annotations
@@ -112,6 +116,10 @@ class Application:
         self._last_status_change = self._clock.now()
         self._stream_was_frozen = False
         self._stream_was_timed_out = False
+        # None until the first _loop_once() completes - gui.py's view
+        # model layer handles this (renders a "starting up" default).
+        self._last_system_status = None
+        self._last_stream_status = None
 
     def _set_state(self, state: SystemState) -> None:
         if state != self._state:
@@ -123,7 +131,13 @@ class Application:
         logger.info("Shutdown requested")
         self._shutdown_requested = True
 
-    def run(self) -> None:
+    def start(self) -> bool:
+        """Runs self-test + camera connect. Returns True if monitoring can
+        proceed, False on a fatal startup fault (already logged, state set
+        to SYSTEM_FAULT, heartbeat published). Split out from run() so
+        gui.py can drive the same startup sequence before switching to its
+        own Tkinter-scheduled tick loop instead of run()'s blocking one.
+        """
         signal.signal(signal.SIGINT, self.request_shutdown)
         signal.signal(signal.SIGTERM, self.request_shutdown)
 
@@ -134,12 +148,37 @@ class Application:
             logger.error("Camera self-test failed: %s", exc)
             self._set_state(SystemState.SYSTEM_FAULT)
             self._publish_heartbeat()
-            return
+            return False
 
         self._set_state(SystemState.MONITORING)
 
         if self._interactive_ack and self._region_monitor is not None:
             self._start_interactive_ack_listener()
+
+        return True
+
+    def shutdown(self) -> None:
+        self._set_state(SystemState.SHUTTING_DOWN)
+        self._camera.disconnect()
+        self._set_state(SystemState.STOPPED)
+        self._publish_heartbeat()
+
+    def acknowledge(self, region_id: str):
+        """Acknowledge an active alarm for a region. Shared by the
+        interactive-ack CLI listener and gui.py's Acknowledge button, so
+        there's exactly one place that knows acknowledging must also tell
+        AlarmManager to stop repeating.
+        """
+        if self._region_monitor is None:
+            return None
+        event = self._region_monitor.acknowledge(region_id)
+        if event is not None and self._alarm_manager is not None:
+            self._alarm_manager.handle_event(event)
+        return event
+
+    def run(self) -> None:
+        if not self.start():
+            return
 
         try:
             while not self._shutdown_requested:
@@ -151,10 +190,7 @@ class Application:
             self._publish_heartbeat()
             raise
         finally:
-            self._set_state(SystemState.SHUTTING_DOWN)
-            self._camera.disconnect()
-            self._set_state(SystemState.STOPPED)
-            self._publish_heartbeat()
+            self.shutdown()
 
     def _loop_once(self) -> None:
         frame = self._camera.read_frame()
@@ -218,6 +254,11 @@ class Application:
             stream_timed_out=stream_status.timed_out,
         )
         logger.debug("Status: %s", status)
+        # Cached for gui.py to read each tick, since it lives in the same
+        # process and shouldn't need to recompute or re-derive this itself
+        # (Rule 1: it displays state, it doesn't compute it).
+        self._last_system_status = status
+        self._last_stream_status = stream_status
 
         self._publish_heartbeat()
 
@@ -271,12 +312,10 @@ class Application:
                 else:
                     print(f"Multiple regions configured - use: ack <region_id> ({region_ids})")
                     continue
-                event = self._region_monitor.acknowledge(region_id)
+                event = self.acknowledge(region_id)
                 if event is None:
                     print(f"No-op: region '{region_id}' isn't currently ALARM_ACTIVE (or doesn't exist)")
                 else:
-                    if self._alarm_manager is not None:
-                        self._alarm_manager.handle_event(event)
                     print(f"Acknowledged region '{region_id}'")
 
         thread = threading.Thread(target=_listen, daemon=True)
@@ -324,9 +363,9 @@ def main() -> None:
         "--interactive-ack",
         action="store_true",
         help=(
-            "TEMPORARY test flag for milestone 4: lets you type 'ack' in "
-            "the terminal to acknowledge an active alarm, since there's no "
-            "GUI yet. Will be removed once the GUI milestone exists."
+            "Terminal-based alternative to --gui: type 'ack' to acknowledge "
+            "an active alarm. Ignored if --gui is also passed (the dashboard "
+            "has a real Acknowledge button)."
         ),
     )
     parser.add_argument(
@@ -348,6 +387,15 @@ def main() -> None:
         help=(
             "Seconds with no valid frame before the stream is considered timed "
             "out. Defaults to --frame-timeout if not given."
+        ),
+    )
+    parser.add_argument(
+        "--gui",
+        action="store_true",
+        help=(
+            "Run the live Tkinter dashboard instead of the headless CLI loop. "
+            "Runs in the same process, with an Acknowledge button per region "
+            "instead of --interactive-ack."
         ),
     )
     args = parser.parse_args()
@@ -389,12 +437,26 @@ def main() -> None:
         regions=regions,
         saturation_min=saturation_min,
         value_min=value_min,
-        interactive_ack=args.interactive_ack,
+        interactive_ack=(args.interactive_ack and not args.gui),
         alarm_repeat_interval_seconds=args.alarm_repeat_seconds,
         stream_frozen_threshold_seconds=args.stream_frozen_threshold,
         stream_timeout_seconds=args.stream_timeout,
     )
-    app.run()
+
+    if args.gui:
+        # Lazy import: Tkinter needs OS-level Tk libraries that aren't
+        # guaranteed present everywhere (e.g. minimal containers), so
+        # headless (--gui not passed) usage must never require it.
+        from screen_monitor.interface.gui import Dashboard
+
+        dashboard = Dashboard(
+            app,
+            config_path=Path(args.config) if args.config else None,
+            device_index=args.device_index,
+        )
+        dashboard.start()
+    else:
+        app.run()
 
 
 if __name__ == "__main__":
