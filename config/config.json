@@ -22,7 +22,7 @@
       "red_percentage_threshold": 0.3,
       "confidence_threshold": 0.8,
       "confirmation_seconds": 2.0,
-      "alarm_seconds": 300.0
+      "alarm_seconds": 10.0
     }
   ],
   "detection": {
