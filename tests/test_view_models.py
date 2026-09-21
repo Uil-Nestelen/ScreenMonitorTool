@@ -1,18 +1,25 @@
-"""Unit tests for interface/view_models.py - pure logic, no Tkinter/UI
-needed, so these run the same everywhere."""
+"""Unit tests for the dashboard view models (no display needed)."""
 
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from screen_monitor.common.enums import FrameHealthReason, HealthStatus, RegionStatus, SystemState
+from screen_monitor.common.enums import (
+    DetectionStatus,
+    FrameHealthReason,
+    HealthStatus,
+    RegionStatus,
+    SystemState,
+)
+from screen_monitor.detection.detector import DetectionResult
+from screen_monitor.detection.region import Region
 from screen_monitor.diagnostics.system_status import SystemStatus
-from screen_monitor.interface.view_models import build_dashboard_view_model, build_region_view_model
+from screen_monitor.interface.view_models import build_dashboard_view_model
 from screen_monitor.monitoring.region_state import RegionState
 
 
-def make_system_status(**overrides):
+def make_status(**overrides):
     defaults = dict(
         overall_state=SystemState.MONITORING,
         camera_connected=True,
@@ -20,7 +27,7 @@ def make_system_status(**overrides):
         last_frame_reason=FrameHealthReason.VALID,
         last_frame_age_seconds=0.1,
         watchdog_visible=True,
-        stream_frame_rate=5.0,
+        stream_frame_rate=4.6,
         stream_frozen=False,
         stream_timed_out=False,
     )
@@ -28,128 +35,108 @@ def make_system_status(**overrides):
     return SystemStatus(**defaults)
 
 
-# -- build_region_view_model -----------------------------------------------
+def make_region(rid, name=None, **kw):
+    return Region(id=rid, name=name or rid, x=0, y=0, width=50, height=50, **kw)
 
 
-def test_region_view_model_reflects_status_and_alarm():
-    state = RegionState(region_id="r1", status=RegionStatus.ALARM_ACTIVE, last_reason="red confirmed")
-
-    vm = build_region_view_model(state, is_alarming=True)
-
-    assert vm.region_id == "r1"
-    assert vm.status_label == "ALARM_ACTIVE"
-    assert vm.is_alarming is True
-    assert vm.can_acknowledge is True
-    assert vm.detail == "red confirmed"
-
-
-def test_region_view_model_can_acknowledge_only_when_alarm_active():
-    for status in (RegionStatus.NORMAL, RegionStatus.RED_PENDING, RegionStatus.RED_ACTIVE, RegionStatus.ALARM_ACKNOWLEDGED):
-        state = RegionState(region_id="r1", status=status)
-        vm = build_region_view_model(state, is_alarming=False)
-        assert vm.can_acknowledge is False, f"{status} should not be acknowledgeable"
-
-    state = RegionState(region_id="r1", status=RegionStatus.ALARM_ACTIVE)
-    vm = build_region_view_model(state, is_alarming=True)
-    assert vm.can_acknowledge is True
-
-
-# -- build_dashboard_view_model ---------------------------------------------
-
-
-def test_dashboard_view_model_with_no_status_yet():
-    """Before the first loop cycle, system_status is None - the dashboard
-    should render a sensible default rather than crash."""
-    vm = build_dashboard_view_model(system_status=None, region_states={}, is_alarming_fn=None)
-
-    assert vm.overall_state == SystemState.STARTING.value
-    assert vm.camera_connected is False
-    assert vm.regions == []
-    assert vm.has_active_alarm is False
-    assert vm.fault_message is None
-
-
-def test_dashboard_view_model_maps_system_status_fields():
-    status = make_system_status(
-        overall_state=SystemState.MONITORING,
-        camera_connected=True,
-        camera_status=HealthStatus.OK,
-        stream_frame_rate=3.5,
+def build(status, states=None, regions=(), detections=(), acked=(), alarming=()):
+    states = states or {}
+    return build_dashboard_view_model(
+        status, states, lambda rid: rid in alarming,
+        regions=regions, detections=detections, acknowledged_faults=acked,
     )
 
-    vm = build_dashboard_view_model(status, region_states={}, is_alarming_fn=None)
 
-    assert vm.overall_state == "MONITORING"
-    assert vm.camera_connected is True
-    assert vm.camera_status == "OK"
-    assert vm.stream_frame_rate == 3.5
-
-
-def test_dashboard_view_model_aggregates_regions_and_alarm_flag():
-    region_states = {
-        "r1": RegionState(region_id="r1", status=RegionStatus.NORMAL),
-        "r2": RegionState(region_id="r2", status=RegionStatus.ALARM_ACTIVE),
-    }
-
-    def is_alarming(region_id):
-        return region_id == "r2"
-
-    vm = build_dashboard_view_model(make_system_status(), region_states, is_alarming)
-
-    assert len(vm.regions) == 2
-    assert vm.has_active_alarm is True
-    r1 = next(r for r in vm.regions if r.region_id == "r1")
-    r2 = next(r for r in vm.regions if r.region_id == "r2")
-    assert r1.is_alarming is False
-    assert r2.is_alarming is True
+def test_healthy_system_matches_normal_mode_mockup():
+    vm = build(make_status())
+    assert vm.watchdog_label == "Heartbeat Published" and vm.watchdog_ok is True
+    assert vm.stream_label == "Healthy" and vm.stream_ok is True
+    assert vm.fps_text == "4.6fps" and vm.fps_ok is True
+    assert not (vm.watchdog_can_acknowledge or vm.stream_can_acknowledge or vm.fps_can_acknowledge)
 
 
-def test_dashboard_view_model_no_alarm_when_nothing_alarming():
-    region_states = {"r1": RegionState(region_id="r1", status=RegionStatus.RED_ACTIVE)}
-
-    vm = build_dashboard_view_model(make_system_status(), region_states, lambda rid: False)
-
-    assert vm.has_active_alarm is False
-
-
-def test_dashboard_view_model_regions_sorted_by_id():
-    region_states = {
-        "zebra": RegionState(region_id="zebra", status=RegionStatus.NORMAL),
-        "alpha": RegionState(region_id="alpha", status=RegionStatus.NORMAL),
-    }
-
-    vm = build_dashboard_view_model(make_system_status(), region_states, lambda rid: False)
-
-    assert [r.region_id for r in vm.regions] == ["alpha", "zebra"]
+def test_failing_system_matches_editor_mode_mockup():
+    vm = build(make_status(
+        camera_connected=False, camera_status=HealthStatus.FAULT,
+        watchdog_visible=False, stream_frame_rate=0.0, last_frame_age_seconds=None,
+    ))
+    assert vm.watchdog_label == "Heartbeat Missing" and vm.watchdog_ok is False
+    assert vm.stream_label == "Missing" and vm.stream_ok is False
+    assert vm.fps_text == "0fps" and vm.fps_ok is False
+    assert vm.watchdog_can_acknowledge and vm.stream_can_acknowledge
+    # a dead stream is acknowledged via Stream Status, not the fps button
+    assert not vm.fps_can_acknowledge
 
 
-# -- fault_message -----------------------------------------------------
+def test_frozen_and_timed_out_labels():
+    assert build(make_status(stream_frozen=True)).stream_label == "Frozen"
+    assert build(make_status(stream_timed_out=True)).stream_label == "Timed out"
 
 
-def test_fault_message_none_when_healthy():
-    vm = build_dashboard_view_model(make_system_status(), {}, None)
-    assert vm.fault_message is None
+def test_acknowledged_fault_disables_button_and_says_so():
+    vm = build(make_status(stream_frozen=True), acked={"stream"})
+    assert vm.stream_label == "Frozen (acknowledged)"
+    assert vm.stream_ok is False  # still a fault, just acknowledged
+    assert not vm.stream_can_acknowledge
 
 
-def test_fault_message_camera_disconnected():
-    status = make_system_status(camera_connected=False, camera_status=HealthStatus.FAULT)
-    vm = build_dashboard_view_model(status, {}, None)
-    assert vm.fault_message == "Camera disconnected"
+def test_low_fps_is_its_own_acknowledgeable_fault():
+    vm = build(make_status(stream_frame_rate=0.4))
+    assert vm.stream_ok is True
+    assert vm.fps_ok is False and vm.fps_can_acknowledge
 
 
-def test_fault_message_stream_frozen():
-    status = make_system_status(stream_frozen=True)
-    vm = build_dashboard_view_model(status, {}, None)
-    assert "frozen" in vm.fault_message.lower()
+def test_no_status_yet_renders_neutral_starting_state():
+    vm = build(None)
+    assert vm.overall_state == SystemState.STARTING.value
+    assert vm.watchdog_ok is None and vm.stream_ok is None
 
 
-def test_fault_message_stream_timed_out():
-    status = make_system_status(stream_timed_out=True)
-    vm = build_dashboard_view_model(status, {}, None)
-    assert "timed out" in vm.fault_message.lower()
+def test_regions_keep_config_order_not_alphabetical():
+    regions = [make_region("region_2"), make_region("region_10"), make_region("region_1")]
+    states = {r.id: RegionState(region_id=r.id) for r in regions}
+    vm = build(make_status(), states, regions=regions)
+    assert [r.region_id for r in vm.regions] == ["region_2", "region_10", "region_1"]
 
 
-def test_fault_message_camera_disconnect_takes_priority_over_stream_issues():
-    status = make_system_status(camera_connected=False, stream_frozen=True, stream_timed_out=True)
-    vm = build_dashboard_view_model(status, {}, None)
-    assert vm.fault_message == "Camera disconnected"
+def test_without_config_regions_fall_back_to_id_order():
+    states = {rid: RegionState(region_id=rid) for rid in ("b", "a")}
+    vm = build(make_status(), states)
+    assert [r.region_id for r in vm.regions] == ["a", "b"]
+
+
+def test_region_row_uses_name_threshold_and_detection():
+    region = make_region("z1", name="bigzone", red_percentage_threshold=0.3)
+    det = DetectionResult(DetectionStatus.NORMAL, 0.9, 0.12, 0.0, "z1")
+    vm = build(make_status(), {"z1": RegionState(region_id="z1")}, regions=[region], detections=[det])
+    row = vm.regions[0]
+    assert row.display_name == "bigzone"
+    assert row.red_threshold == 0.3
+    assert row.red_percentage == 0.12
+    assert row.severity == "ok" and row.can_edit
+
+
+def test_unknown_reading_flags_region_but_alarm_wins():
+    region = make_region("z1")
+    unknown = DetectionResult(DetectionStatus.UNKNOWN, 0.0, 0.0, 0.0, "z1")
+    vm = build(make_status(), {"z1": RegionState(region_id="z1")}, regions=[region], detections=[unknown])
+    assert vm.regions[0].severity == "unknown"
+
+    alarm_state = RegionState(region_id="z1", status=RegionStatus.ALARM_ACTIVE)
+    vm = build(make_status(), {"z1": alarm_state}, regions=[region], detections=[unknown], alarming={"z1"})
+    row = vm.regions[0]
+    assert row.severity == "alarm"
+    assert row.can_acknowledge
+    assert not row.can_edit  # can't redraw an unacknowledged alarm
+    assert vm.has_active_alarm and vm.alarming_region_names == ["z1"]
+
+
+def test_severity_by_status():
+    region = make_region("z1")
+    for status, expected in [
+        (RegionStatus.RED_PENDING, "pending"),
+        (RegionStatus.RED_ACTIVE, "pending"),
+        (RegionStatus.ALARM_ACKNOWLEDGED, "acknowledged"),
+    ]:
+        vm = build(make_status(), {"z1": RegionState(region_id="z1", status=status)}, regions=[region])
+        assert vm.regions[0].severity == expected

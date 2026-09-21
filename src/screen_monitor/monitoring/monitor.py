@@ -17,6 +17,7 @@ import logging
 from typing import Callable, Dict, List, Optional, Sequence
 
 from screen_monitor.common.clock import Clock
+from screen_monitor.common.enums import RegionStatus
 from screen_monitor.detection.detector import DetectionResult
 from screen_monitor.detection.region import Region
 from screen_monitor.monitoring.events import Event, EventType
@@ -60,6 +61,7 @@ class RegionMonitor:
         alarm_hook: Optional[AlarmHook] = None,
     ) -> None:
         timer = RegionTimer(clock)
+        self._timer = timer
         self._clock = clock
         self._state_machines: Dict[str, RegionStateMachine] = {
             region.id: RegionStateMachine(region, timer) for region in regions
@@ -118,6 +120,40 @@ class RegionMonitor:
             logger.info("Event: %s (region='%s')", event.type.value, event.region_id)
 
         return event
+
+    def replace_region(self, region: Region) -> bool:
+        """Swap in an updated definition (e.g. a redrawn box) for an
+        already-configured region, resetting its state to NORMAL.
+
+        Refused (returns False) if the region is unknown or currently
+        ALARM_ACTIVE: an unacknowledged alarm must never be able to
+        disappear as a side effect of editing, per the state machine's
+        safety gate. Acknowledge it first.
+        """
+        state = self._states.get(region.id)
+        if state is None:
+            logger.warning("Cannot replace unconfigured region '%s'", region.id)
+            return False
+        if state.status == RegionStatus.ALARM_ACTIVE:
+            logger.warning(
+                "Refusing to replace region '%s' while its alarm is active", region.id
+            )
+            return False
+
+        self._state_machines[region.id] = RegionStateMachine(region, self._timer)
+        self._states[region.id] = RegionState(region_id=region.id)
+        logger.info("Region '%s' updated - state reset to NORMAL", region.id)
+        return True
+
+    def add_region(self, region: Region) -> bool:
+        """Start monitoring a new region. Returns False if the id is taken."""
+        if region.id in self._states:
+            logger.warning("Cannot add region '%s': id already in use", region.id)
+            return False
+        self._state_machines[region.id] = RegionStateMachine(region, self._timer)
+        self._states[region.id] = RegionState(region_id=region.id)
+        logger.info("Region '%s' added", region.id)
+        return True
 
     def get_state(self, region_id: str) -> Optional[RegionState]:
         return self._states.get(region_id)

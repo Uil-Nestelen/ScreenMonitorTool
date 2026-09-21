@@ -10,6 +10,8 @@ configuration + red detection without over-building ahead of need.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import List
 
@@ -29,6 +31,39 @@ def load_config(path: Path) -> dict:
             return json.load(f)
     except json.JSONDecodeError as exc:
         raise ConfigError(f"Config file {path} is not valid JSON: {exc}") from exc
+
+
+def save_region(path: Path, region: Region) -> None:
+    """Insert or update one region in the config file, keeping every
+    other key (other regions, detection settings) untouched.
+
+    An existing region with the same id is replaced in place so the
+    config's region order (which the dashboard displays in) is stable.
+    Written atomically (temp file + os.replace) so a crash mid-save can
+    never leave a truncated config behind.
+    """
+    path = Path(path)
+    config = load_config(path) if path.exists() else {"regions": []}
+
+    regions = config.get("regions", [])
+    for index, raw in enumerate(regions):
+        if raw.get("id") == region.id:
+            regions[index] = region.to_dict()
+            break
+    else:
+        regions.append(region.to_dict())
+    config["regions"] = regions
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=path.parent, prefix=".config_", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(config, f, indent=2)
+        os.replace(tmp_path, path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
 
 
 def load_regions(config: dict) -> List[Region]:

@@ -9,9 +9,19 @@ warrant surfacing them here too.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Set
 
 from screen_monitor.common.enums import FrameHealthReason, HealthStatus, SystemState
+
+
+# Below this (but above zero) a stream that is otherwise healthy is
+# reported as a "low frame rate" fault. The main loop runs at ~5 fps by
+# default, so a healthy stream sits well above this.
+LOW_FPS_THRESHOLD = 1.0
+
+FAULT_WATCHDOG = "watchdog"
+FAULT_STREAM = "stream"
+FAULT_FPS = "fps"
 
 
 @dataclass
@@ -25,6 +35,31 @@ class SystemStatus:
     stream_frame_rate: float = 0.0
     stream_frozen: bool = False
     stream_timed_out: bool = False
+
+    def active_faults(self) -> Set[str]:
+        """Which system-level faults are currently active.
+
+        Shared by the Application (to know when an acknowledged fault has
+        cleared) and the dashboard view model (to know what to display),
+        so there is exactly one definition of "the stream is faulted".
+        """
+        faults: Set[str] = set()
+
+        if not self.watchdog_visible:
+            faults.add(FAULT_WATCHDOG)
+
+        stream_fault = (
+            not self.camera_connected
+            or self.stream_frozen
+            or self.stream_timed_out
+            or self.last_frame_age_seconds is None
+        )
+        if stream_fault:
+            faults.add(FAULT_STREAM)
+        elif 0.0 < self.stream_frame_rate < LOW_FPS_THRESHOLD:
+            faults.add(FAULT_FPS)
+
+        return faults
 
 
 def build_status(

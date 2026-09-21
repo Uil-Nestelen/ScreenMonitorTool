@@ -27,7 +27,7 @@ class UsbCameraError(RuntimeError):
 class UsbCamera(CameraSource):
     def __init__(
         self,
-        device_index: int = 0,
+        device_index: int = 1,
         expected_width: Optional[int] = None,
         expected_height: Optional[int] = None,
         clock: Optional[Clock] = None,
