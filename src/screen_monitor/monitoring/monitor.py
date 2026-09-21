@@ -121,19 +121,27 @@ class RegionMonitor:
 
         return event
 
-    def replace_region(self, region: Region) -> bool:
-        """Swap in an updated definition (e.g. a redrawn box) for an
-        already-configured region, resetting its state to NORMAL.
+    def replace_region(self, region: Region, keep_state: bool = False) -> bool:
+        """Swap in an updated definition (a redrawn box, new thresholds or
+        timings) for an already-configured region, resetting its state to
+        NORMAL.
 
         Refused (returns False) if the region is unknown or currently
         ALARM_ACTIVE: an unacknowledged alarm must never be able to
         disappear as a side effect of editing, per the state machine's
         safety gate. Acknowledge it first.
+
+        `keep_state=True` is for purely cosmetic edits (renaming): the
+        definition is swapped but the running timers/state are untouched,
+        so it is allowed at any time.
         """
         state = self._states.get(region.id)
         if state is None:
             logger.warning("Cannot replace unconfigured region '%s'", region.id)
             return False
+        if keep_state:
+            self._state_machines[region.id] = RegionStateMachine(region, self._timer)
+            return True
         if state.status == RegionStatus.ALARM_ACTIVE:
             logger.warning(
                 "Refusing to replace region '%s' while its alarm is active", region.id

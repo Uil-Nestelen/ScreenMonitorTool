@@ -14,6 +14,7 @@ unit-testable without a display.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence
 
@@ -57,6 +58,14 @@ class RegionViewModel:
     # interpreting RegionStatus itself: "ok" | "unknown" | "pending" |
     # "alarm" | "acknowledged".
     severity: str = "ok"
+    # Editable settings, so the editor can show them (see region_form.py).
+    confirmation_seconds: float = 0.0
+    alarm_seconds: float = 0.0
+    # One-line human status for the row, e.g.
+    # "Red confirmed \u00b7 alarm in 4m 15s \u00b7 100% red".
+    subtitle: str = ""
+    # Short countdown for the stream label ("" when nothing is counting).
+    countdown_text: str = ""
 
     @property
     def display_name(self) -> str:
@@ -99,6 +108,51 @@ _SEVERITY_BY_STATUS = {
 }
 
 
+def _format_duration(seconds: float) -> str:
+    seconds = max(0, math.ceil(seconds))
+    minutes, secs = divmod(seconds, 60)
+    return f"{minutes}m {secs:02d}s" if minutes else f"{secs}s"
+
+
+def _countdown_text(state: RegionState, region: Optional[Region], now: Optional[float]) -> str:
+    """How long until this region's next transition, as display text.
+
+    Purely a readout of timers the state machine already runs (started_at
+    stamps + the region's configured durations) - it decides nothing.
+    """
+    if now is None or region is None:
+        return ""
+    if state.status == RegionStatus.RED_PENDING and state.red_started_at is not None:
+        remaining = region.confirmation_seconds - (now - state.red_started_at)
+        return f"confirming {_format_duration(remaining)}"
+    if state.status == RegionStatus.RED_ACTIVE and state.confirmed_at is not None:
+        remaining = region.alarm_seconds - (now - state.confirmed_at)
+        return f"alarm in {_format_duration(remaining)}"
+    return ""
+
+
+_STATUS_TEXT = {
+    RegionStatus.NORMAL: "Normal",
+    RegionStatus.RED_PENDING: "Red detected",
+    RegionStatus.RED_ACTIVE: "Red confirmed",
+    RegionStatus.ALARM_ACTIVE: "ALARM - acknowledge to silence",
+    RegionStatus.ALARM_ACKNOWLEDGED: "Acknowledged - waiting for normal",
+}
+
+
+def _subtitle(
+    state: RegionState, countdown: str, red_percentage: Optional[float], reading_unknown: bool
+) -> str:
+    parts = [_STATUS_TEXT[state.status]]
+    if countdown:
+        parts.append(countdown)
+    if reading_unknown:
+        parts.append("can't read region")
+    elif red_percentage is not None:
+        parts.append(f"{red_percentage:.0%} red")
+    return " \u00b7 ".join(parts)
+
+
 def _severity(state: RegionState, reading_unknown: bool) -> str:
     severity = _SEVERITY_BY_STATUS[state.status]
     # An unreadable region that isn't otherwise in trouble is worth
@@ -114,8 +168,11 @@ def build_region_view_model(
     is_alarming: bool,
     region: Optional[Region] = None,
     detection: Optional[DetectionResult] = None,
+    now: Optional[float] = None,
 ) -> RegionViewModel:
     reading_unknown = detection is not None and detection.status == DetectionStatus.UNKNOWN
+    red_percentage = detection.red_percentage if detection is not None else None
+    countdown = _countdown_text(state, region, now)
     return RegionViewModel(
         region_id=state.region_id,
         status_label=state.status.value,
@@ -125,9 +182,13 @@ def build_region_view_model(
         name=region.name if region is not None else "",
         red_threshold=region.red_percentage_threshold if region is not None else 0.0,
         can_edit=state.status not in _LOCKED_STATUSES,
-        red_percentage=detection.red_percentage if detection is not None else None,
+        red_percentage=red_percentage,
         reading_unknown=reading_unknown,
         severity=_severity(state, reading_unknown),
+        confirmation_seconds=region.confirmation_seconds if region is not None else 0.0,
+        alarm_seconds=region.alarm_seconds if region is not None else 0.0,
+        subtitle=_subtitle(state, countdown, red_percentage, reading_unknown),
+        countdown_text=countdown,
     )
 
 
@@ -172,6 +233,7 @@ def build_dashboard_view_model(
     regions: Sequence[Region] = (),
     detections: Iterable[DetectionResult] = (),
     acknowledged_faults: Iterable[str] = (),
+    now: Optional[float] = None,
 ) -> DashboardViewModel:
     """Build the full dashboard view model.
 
@@ -198,6 +260,7 @@ def build_dashboard_view_model(
             is_alarming,
             region=region_by_id.get(region_id),
             detection=detection_by_id.get(region_id),
+            now=now,
         )
         has_active_alarm = has_active_alarm or is_alarming
         if is_alarming:

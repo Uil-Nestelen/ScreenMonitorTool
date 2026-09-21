@@ -52,6 +52,7 @@ except ImportError as exc:  # pragma: no cover - environment dependent
     ) from exc
 
 from screen_monitor.detection.region import Region
+from screen_monitor.interface.region_form import FORM_KEYS, form_texts, parse_region_form
 from screen_monitor.interface.status_display import (
     BUTTON_BG,
     BUTTON_DISABLED_FG,
@@ -113,8 +114,16 @@ def _flat_button(master: tk.Misc, text: str, command, **kwargs) -> tk.Button:
 
 
 class RegionRow:
-    """One row of the left-hand region list, with an expandable detail
-    section (the mockup's "editor mode")."""
+    """One row of the left-hand region list, with an expandable editor
+    (the mockup's "editor mode")."""
+
+    _SUBTITLE_COLOR = {
+        "ok": "#9aa5b1",
+        "unknown": "#9e9e9e",
+        "pending": _SEVERITY_COLOR["pending"],
+        "alarm": _SEVERITY_COLOR["alarm"],
+        "acknowledged": _SEVERITY_COLOR["acknowledged"],
+    }
 
     def __init__(
         self,
@@ -125,15 +134,21 @@ class RegionRow:
         on_toggle,
         on_edit,
         on_redraw,
+        on_apply,
     ) -> None:
         self.region_id = vm.region_id
         self._expanded = False
+        self._on_apply = on_apply
+        # The values last received from the engine, as form text. Entries
+        # are only overwritten when these change, so a live refresh never
+        # clobbers what the user is in the middle of typing.
+        self._engine_texts: Optional[Tuple[str, ...]] = None
 
         self.frame = tk.Frame(parent, bg=PANEL_BG, highlightbackground="white", highlightthickness=1)
         self.frame.pack(fill="x", pady=3)
 
         top = tk.Frame(self.frame, bg=PANEL_BG)
-        top.pack(fill="x", padx=6, pady=4)
+        top.pack(fill="x", padx=6, pady=(4, 0))
 
         self._name = tk.Label(
             top, text=vm.display_name, bg=PANEL_BG, fg=PANEL_TEXT, font=(_FONT, 11), anchor="w"
@@ -161,23 +176,63 @@ class RegionRow:
         self._toggle = ToggleSwitch(top, value=overlay_visible, on_toggle=on_toggle)
         self._toggle.pack(side="right")
 
-        # Detail section - only packed while expanded.
+        self._subtitle = tk.Label(
+            self.frame, text="", bg=PANEL_BG, fg="#9aa5b1", font=(_FONT, 8), anchor="w"
+        )
+        self._subtitle.pack(fill="x", padx=8, pady=(0, 4))
+
+        # -- editor section - only packed while expanded ----------------
         self._details = tk.Frame(self.frame, bg=PANEL_BG)
         grid = tk.Frame(self._details, bg=PANEL_BG)
         grid.pack(fill="x", padx=10, pady=(0, 4))
         grid.columnconfigure(1, weight=1)
 
+        self._vars = {key: tk.StringVar() for key in FORM_KEYS}
+        fields = [
+            ("Name:", "name", "#ffffff", 16),
+            ("Threshold (0-1):", "threshold", "#ffb347", 8),
+            ("Confirm after (s):", "confirmation", "#ffb347", 8),
+            ("Alarm after (s):", "alarm", "#ffb347", 8),
+        ]
+        for index, (label, key, color, width) in enumerate(fields):
+            tk.Label(grid, text=label, bg=PANEL_BG, fg=PANEL_TEXT, font=(_FONT, 8, "bold")).grid(
+                row=index, column=0, sticky="w"
+            )
+            entry = tk.Entry(
+                grid,
+                textvariable=self._vars[key],
+                width=width,
+                justify="right",
+                bg="#1c1c1c",
+                fg=color,
+                insertbackground="white",
+                relief="flat",
+                highlightthickness=1,
+                highlightbackground="#555555",
+                highlightcolor="#7fdbff",
+                font=(_FONT, 9),
+            )
+            entry.grid(row=index, column=1, sticky="e", pady=1)
+            entry.bind("<Return>", lambda _event: self._apply())
+
         tk.Label(grid, text="Detecting color:", bg=PANEL_BG, fg=PANEL_TEXT, font=(_FONT, 8, "bold")).grid(
-            row=0, column=0, sticky="w"
+            row=len(fields), column=0, sticky="w"
         )
         self._color_value = tk.Label(grid, text="RED", bg=PANEL_BG, fg="#7fdbff", font=(_FONT, 8, "bold"))
-        self._color_value.grid(row=0, column=1, sticky="e")
+        self._color_value.grid(row=len(fields), column=1, sticky="e")
 
-        tk.Label(grid, text="Threshold:", bg=PANEL_BG, fg=PANEL_TEXT, font=(_FONT, 8, "bold")).grid(
-            row=1, column=0, sticky="w"
+        buttons = tk.Frame(self._details, bg=PANEL_BG)
+        buttons.pack(fill="x", padx=10, pady=(2, 0))
+        self._apply_button = _flat_button(buttons, "Apply", self._apply, bg="#2b8a3e", fg="white")
+        self._apply_button.pack(side="left", padx=(0, 6))
+        self._revert_button = _flat_button(buttons, "Revert", self._revert)
+        self._revert_button.pack(side="left")
+
+        self._message = tk.Label(
+            self._details, text="", bg=PANEL_BG, fg="#ff6b6b", font=(_FONT, 8), anchor="w",
+            wraplength=250, justify="left",
         )
-        self._threshold_value = tk.Label(grid, text="", bg=PANEL_BG, fg="#ffb347", font=(_FONT, 8, "bold"))
-        self._threshold_value.grid(row=1, column=1, sticky="e")
+        self._message.pack(fill="x", padx=10)
 
         self._redraw = tk.Button(
             self._details,
@@ -210,7 +265,43 @@ class RegionRow:
         )
         self._collapse.pack(anchor="e", padx=10, pady=(0, 4))
 
+        # Only now that every widget exists is it safe for edits to trigger
+        # the dirty check.
+        for var in self._vars.values():
+            var.trace_add("write", self._on_field_changed)
+
         self.update(vm)
+
+    # -- editor plumbing -------------------------------------------------
+
+    def _current_texts(self) -> Tuple[str, ...]:
+        return tuple(self._vars[key].get() for key in FORM_KEYS)
+
+    def _on_field_changed(self, *_args) -> None:
+        self._message.config(text="")
+        self._refresh_dirty()
+
+    def _refresh_dirty(self) -> None:
+        if self._engine_texts is None:
+            return
+        state = "normal" if self._current_texts() != self._engine_texts else "disabled"
+        self._apply_button.config(state=state)
+        self._revert_button.config(state=state)
+
+    def _apply(self) -> None:
+        if self._current_texts() != self._engine_texts:
+            self._on_apply(self.region_id, self._current_texts())
+
+    def _revert(self) -> None:
+        if self._engine_texts is not None:
+            for key, text in zip(FORM_KEYS, self._engine_texts):
+                self._vars[key].set(text)
+        self._message.config(text="")
+
+    def set_message(self, text: str, ok: bool) -> None:
+        self._message.config(text=text, fg="#7CFC9A" if ok else "#ff6b6b")
+
+    # -- public ----------------------------------------------------------
 
     @property
     def expanded(self) -> bool:
@@ -231,10 +322,17 @@ class RegionRow:
             text=vm.display_name, fg=_SEVERITY_COLOR["alarm"] if alarming else PANEL_TEXT
         )
         self.frame.config(highlightbackground=_SEVERITY_COLOR["alarm"] if alarming else "white")
+        self._subtitle.config(text=vm.subtitle, fg=self._SUBTITLE_COLOR.get(vm.severity, "#9aa5b1"))
         self._ack.config(state=("normal" if vm.can_acknowledge else "disabled"))
         self._color_value.config(text=vm.detecting_color)
-        self._threshold_value.config(text=f"{vm.red_threshold:.2f}")
         self._redraw.config(state=("normal" if vm.can_edit else "disabled"))
+
+        texts = form_texts(vm.display_name, vm.red_threshold, vm.confirmation_seconds, vm.alarm_seconds)
+        if texts != self._engine_texts:
+            self._engine_texts = texts
+            for key, text in zip(FORM_KEYS, texts):
+                self._vars[key].set(text)
+        self._refresh_dirty()
 
 
 class Dashboard(tk.Tk):
@@ -412,6 +510,7 @@ class Dashboard(tk.Tk):
             regions=self._app.regions,
             detections=self._app.latest_detections(),
             acknowledged_faults=self._app.acknowledged_faults(),
+            now=self._app.now(),
         )
         self._render(view_model)
 
@@ -457,6 +556,7 @@ class Dashboard(tk.Tk):
                 on_toggle=lambda value, rid=rid: self._overlay_visible.__setitem__(rid, value),
                 on_edit=lambda rid=rid: self._toggle_expanded(rid),
                 on_redraw=self._start_redraw,
+                on_apply=self._apply_edit,
             )
             row.set_expanded(rid == self._expanded_id)
             self._rows[rid] = row
@@ -528,6 +628,8 @@ class Dashboard(tk.Tk):
                 label += "  ?"
             elif region_vm.red_percentage is not None:
                 label += f"  {region_vm.red_percentage:.0%}"
+            if region_vm.countdown_text:
+                label += f"  \u00b7 {region_vm.countdown_text}"
 
         # Keep the label on-screen even for a box touching the top edge.
         text_y = y1 - 3 if y1 > 18 else y2 + 14
@@ -643,6 +745,31 @@ class Dashboard(tk.Tk):
             messagebox.showerror(title, result.message)
         elif not result.persisted:
             messagebox.showwarning(title, result.message)
+
+    # -- editing a region's settings ---------------------------------
+
+    def _apply_edit(self, region_id: str, texts) -> None:
+        row = self._rows.get(region_id)
+        old = next((r for r in self._app.regions if r.id == region_id), None)
+        if row is None or old is None:
+            return
+        try:
+            new = parse_region_form(old, *texts)
+        except ValueError as exc:
+            row.set_message(str(exc), ok=False)
+            return
+        if new == old:
+            row.set_message("No changes.", ok=True)
+            return
+
+        result = self._app.replace_region(new)
+        if not result.ok:
+            row.set_message(result.message, ok=False)
+        elif not result.persisted:
+            row.set_message(result.message, ok=False)
+        else:
+            renamed_only = dataclasses.replace(old, name=new.name) == new
+            row.set_message("Saved." if renamed_only else "Saved. This region's timers restarted.", ok=True)
 
     # -- actions -----------------------------------------------------
 

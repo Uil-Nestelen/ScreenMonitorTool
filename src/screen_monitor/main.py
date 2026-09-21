@@ -28,7 +28,7 @@ import logging
 import signal
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import List, Optional, Set
 
@@ -227,6 +227,11 @@ class Application:
     def loop_interval(self) -> float:
         return self._loop_interval
 
+    def now(self) -> float:
+        """The engine's clock, so the dashboard can show timer countdowns
+        against the same clock the state machine uses."""
+        return self._clock.now()
+
     def last_system_status(self):
         return self._last_system_status
 
@@ -265,10 +270,13 @@ class Application:
         index = next((i for i, r in enumerate(self._regions) if r.id == region.id), None)
         if index is None:
             return RegionEditResult(False, f"Region '{region.id}' doesn't exist")
-        error = self._check_fits_frame(region)
+        # A rename doesn't affect detection or timing, so it must not
+        # restart running timers (and is fine during an active alarm).
+        name_only = replace(self._regions[index], name=region.name) == region
+        error = None if name_only else self._check_fits_frame(region)
         if error:
             return RegionEditResult(False, error)
-        if not self._region_monitor.replace_region(region):
+        if not self._region_monitor.replace_region(region, keep_state=name_only):
             return RegionEditResult(
                 False,
                 f"Region '{region.id}' can't be changed right now - acknowledge its alarm first.",

@@ -20,7 +20,7 @@ from typing import Dict, Optional, Set
 
 from screen_monitor.common.clock import Clock
 from screen_monitor.monitoring.events import Event, EventType
-from screen_monitor.alarms.local_audio import AudioBackend, SystemBeepBackend
+from screen_monitor.alarms.local_audio import AudioBackend, default_audio_backend
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +46,8 @@ class AlarmManager:
         repeat_interval_seconds: float = DEFAULT_REPEAT_INTERVAL_SECONDS,
     ) -> None:
         self._clock = clock
-        self._audio = audio_backend or SystemBeepBackend()
+        self._audio = audio_backend or default_audio_backend()
+        logger.info("Alarm audio backend: %s", type(self._audio).__name__)
         self._repeat_interval = repeat_interval_seconds
         self._active_regions: Set[str] = set()
         self._last_played_at: Dict[str, float] = {}
